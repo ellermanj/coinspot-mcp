@@ -1,0 +1,36 @@
+[project]
+name = "coinspot-mcp"
+version = "0.1.0"
+description = "MCP server for the CoinSpot Australia cryptocurrency exchange API"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Cursor Agent", email = "cursoragent@cursor.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp[cli]>=2.0.0",
+]
+
+[project.scripts]
+coinspot-mcp = "coinspot_mcp:main"
+
+[project.urls]
+Homepage = "https://www.coinspot.com.au/v2/api"
+Documentation = "https://www.coinspot.com.au/v2/api"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "respx>=0.23.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
