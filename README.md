@@ -9,7 +9,9 @@ It exposes public market data, read-only account tools, and optional trading/wit
 - **Public API** – latest prices, buy/sell prices, open and completed order books
 - **Read-only API** – balances, open orders, order history, deposits/withdrawals, send/receive, affiliate/referral payments
 - **Full-access API** – quotes, deposit addresses, place/edit/cancel orders, buy/sell/swap now
-- **Safety gates** – trading and withdrawals are disabled unless explicitly enabled via environment variables
+- **Least-privilege exposure** – trading/withdrawal tools are only registered when explicitly enabled
+- **Runtime guards** – optional confirm token, amount caps, and withdrawal address allowlist
+- **Audit logging** – sensitive tool outcomes logged with redacted parameters
 - **HMAC-SHA512 auth** – signs compact JSON bodies as required by CoinSpot
 
 API reference: [CoinSpot API v2](https://www.coinspot.com.au/v2/api) (legacy docs: [v1](https://www.coinspot.com.au/api))
@@ -39,9 +41,15 @@ Copy `.env.example` and set credentials:
 export COINSPOT_API_KEY=your_api_key
 export COINSPOT_API_SECRET=your_api_secret
 
-# Optional – disabled by default
+# Optional – disabled by default (tools are not even advertised)
 export COINSPOT_ALLOW_TRADING=false
 export COINSPOT_ALLOW_WITHDRAWALS=false
+
+# Recommended when enabling destructive tools
+export COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN=long-random-string
+export COINSPOT_MAX_ORDER_AMOUNT=0.01
+export COINSPOT_MAX_WITHDRAW_AMOUNT=0.01
+export COINSPOT_WITHDRAW_ADDRESS_ALLOWLIST=bc1qyouraddress
 ```
 
 Use a **read-only** API key for balances/history only. Use a **full-access** key for trading. Withdrawals must also be enabled on the key in CoinSpot settings.
@@ -99,9 +107,14 @@ uv run pytest
 
 ## Security notes
 
+Aligned with Salt Security MCP hardening themes (visibility, governance, runtime protection):
+
 - Prefer a read-only key when you only need balances and history.
-- Keep `COINSPOT_ALLOW_TRADING` and `COINSPOT_ALLOW_WITHDRAWALS` off unless you intentionally want the model to place orders or withdraw funds.
-- `withdraw_coin` defaults `emailconfirm` to `YES` so CoinSpot still requires email confirmation.
+- Keep `COINSPOT_ALLOW_TRADING` and `COINSPOT_ALLOW_WITHDRAWALS` off unless intentionally enabling write paths; those tools are omitted from the tool catalog when disabled.
+- `withdraw_coin` always sends `emailconfirm=YES`; callers cannot disable CoinSpot email confirmation.
+- When enabling destructive tools, set `COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN`, amount caps, and a withdrawal address allowlist.
+- Audit events are emitted on the `coinspot_mcp.audit` logger with redacted parameters.
+- Tool error responses are sanitized and do not include raw upstream response bodies.
 
 ## License
 

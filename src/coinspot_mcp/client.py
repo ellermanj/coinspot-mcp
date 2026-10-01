@@ -106,10 +106,10 @@ class CoinspotClient:
         try:
             data = response.json()
         except ValueError as exc:
+            # Do not attach raw response bodies — they can leak into MCP/LLM context.
             raise CoinspotError(
                 f"Invalid JSON response (HTTP {response.status_code})",
                 status_code=response.status_code,
-                payload=response.text,
             ) from exc
 
         if response.status_code != 200:
@@ -118,19 +118,17 @@ class CoinspotClient:
                 if isinstance(data, dict)
                 else None
             ) or f"HTTP {response.status_code}"
-            raise CoinspotError(str(message), status_code=response.status_code, payload=data)
+            raise CoinspotError(str(message), status_code=response.status_code)
 
         if isinstance(data, dict) and data.get("status") not in (None, "ok"):
             raise CoinspotError(
                 str(data.get("message") or data.get("status") or "CoinSpot API error"),
                 status_code=response.status_code,
-                payload=data,
             )
         if not isinstance(data, dict):
             raise CoinspotError(
                 "Unexpected response shape",
                 status_code=response.status_code,
-                payload=data,
             )
         return data
 
@@ -561,10 +559,10 @@ class CoinspotClient:
         amount: float | str,
         address: str,
         *,
-        emailconfirm: str = "YES",
         network: str | None = None,
         paymentid: str | None = None,
     ) -> dict[str, Any]:
+        # Always require CoinSpot email confirmation; callers cannot disable this.
         return await self._authenticated_post(
             FULL_BASE,
             "/my/coin/withdraw/send",
@@ -573,7 +571,7 @@ class CoinspotClient:
                     "cointype": cointype.upper(),
                     "amount": amount,
                     "address": address,
-                    "emailconfirm": emailconfirm.upper(),
+                    "emailconfirm": "YES",
                     "network": network,
                     "paymentid": paymentid,
                 }
