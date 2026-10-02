@@ -10,5 +10,7 @@ __pycache__/
 htmlcov/
 dist/
 build/
+.aws-sam/
 *.log
 .DS_Store
+

@@ -33,7 +33,7 @@ mcp = MCPServer(
         "and may require COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN plus amount/address limits."
     ),
     website_url="https://www.coinspot.com.au/v2/api",
-    version="0.1.1",
+    version="0.2.0",
 )
 
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
