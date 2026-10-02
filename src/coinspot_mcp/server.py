@@ -11,7 +11,10 @@ from mcp.types import ToolAnnotations
 
 from coinspot_mcp.client import CoinspotClient, CoinspotError
 from coinspot_mcp.security import (
+    AUDIT_LOGGER,
     audit_event,
+    configure_audit_logging,
+    destructive_confirm_configured,
     enforce_order_amount,
     enforce_withdraw_address,
     enforce_withdraw_amount,
@@ -887,7 +890,7 @@ async def place_buy_order(
         amount: Coin amount to buy.
         rate: Limit rate in market currency.
         markettype: Optional market ticker (default AUD).
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -932,7 +935,7 @@ async def edit_buy_order(
         order_id: Existing buy order id.
         rate: Current order rate.
         newrate: Proposed new rate.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -980,7 +983,7 @@ async def place_buy_now(
         rate: Optional quote rate used with threshold.
         threshold: Optional max percent deviation from rate.
         direction: Optional UP, DOWN, or BOTH.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1029,7 +1032,7 @@ async def place_sell_order(
         amount: Coin amount to sell.
         rate: Limit rate in market currency.
         markettype: Optional market ticker (default AUD).
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1074,7 +1077,7 @@ async def edit_sell_order(
         order_id: Existing sell order id.
         rate: Current order rate.
         newrate: Proposed new rate.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1122,7 +1125,7 @@ async def place_sell_now(
         rate: Optional quote rate used with threshold.
         threshold: Optional max percent deviation from rate.
         direction: Optional UP, DOWN, or BOTH.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1175,7 +1178,7 @@ async def place_swap_now(
         rate: Optional quote rate used with threshold.
         threshold: Optional max percent deviation from rate.
         direction: Optional UP, DOWN, or BOTH.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1218,7 +1221,7 @@ async def cancel_buy_order(
         coinspot_api_key: End-user CoinSpot API key.
         coinspot_api_secret: End-user CoinSpot API secret.
         order_id: Buy order id to cancel.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1253,7 +1256,7 @@ async def cancel_all_buy_orders(
         coinspot_api_key: End-user CoinSpot API key.
         coinspot_api_secret: End-user CoinSpot API secret.
         coin: Optional coin ticker filter.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1288,7 +1291,7 @@ async def cancel_sell_order(
         coinspot_api_key: End-user CoinSpot API key.
         coinspot_api_secret: End-user CoinSpot API secret.
         order_id: Sell order id to cancel.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1323,7 +1326,7 @@ async def cancel_all_sell_orders(
         coinspot_api_key: End-user CoinSpot API key.
         coinspot_api_secret: End-user CoinSpot API secret.
         coin: Optional coin ticker filter.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1393,7 +1396,7 @@ async def withdraw_coin(
         address: Destination address.
         network: Optional network such as ETH or BSC.
         paymentid: Optional memo/payment id where required.
-        confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
+        confirm_token: Required confirm token (must match COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN).
     """
     params = {
         "coinspot_api_key": coinspot_api_key,
@@ -1453,15 +1456,26 @@ def _safe_remove_tool(name: str) -> None:
 
 
 def apply_tool_exposure_policy() -> None:
-    """Register destructive tools only when corresponding env flags are enabled."""
+    """Register destructive tools only when env flags AND confirm token are set."""
+    configure_audit_logging()
     for name in TRADING_TOOL_NAMES + WITHDRAWAL_TOOL_NAMES:
         _safe_remove_tool(name)
 
-    if trading_enabled():
+    want_trading = trading_enabled()
+    want_withdrawals = withdrawals_enabled()
+    if (want_trading or want_withdrawals) and not destructive_confirm_configured():
+        AUDIT_LOGGER.warning(
+            "Trading/withdrawal flags are enabled but "
+            "COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is unset; "
+            "refusing to register privileged tools."
+        )
+        return
+
+    if want_trading:
         for name in TRADING_TOOL_NAMES:
             mcp.add_tool(_PRIVILEGED_TOOLS[name], name=name, annotations=_DESTRUCTIVE)
 
-    if withdrawals_enabled():
+    if want_withdrawals:
         mcp.add_tool(
             get_coin_withdraw_details,
             name="get_coin_withdraw_details",

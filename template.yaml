@@ -6,8 +6,18 @@ Parameters:
   McpAuthToken:
     Type: String
     NoEcho: true
-    MinLength: 16
-    Description: Required bearer token for MCP Function URL access (Authorization Bearer)
+    MinLength: 32
+    Description: Required MCP bearer token (generate with openssl rand -hex 32). Do not use example placeholders.
+  McpAllowedHosts:
+    Type: String
+    Default: ""
+    Description: Comma-separated allowed Host headers for DNS-rebinding protection (set to Function URL hostname after first deploy)
+  ReservedConcurrency:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+    Description: Cap concurrent Lambda executions to limit unauthenticated invoke cost
   AllowTrading:
     Type: String
     Default: "false"
@@ -20,7 +30,7 @@ Parameters:
     Type: String
     NoEcho: true
     Default: ""
-    Description: Optional confirm token required for destructive tools
+    Description: Required when AllowTrading or AllowWithdrawals is true (min 32 chars recommended)
   MaxOrderAmount:
     Type: String
     Default: ""
@@ -33,6 +43,9 @@ Parameters:
     Type: String
     Default: ""
     Description: Optional comma-separated withdrawal address allowlist
+
+Conditions:
+  HasAllowedHosts: !Not [!Equals [!Ref McpAllowedHosts, ""]]
 
 Globals:
   Function:
@@ -51,26 +64,21 @@ Resources:
       Description: CoinSpot Australia MCP server (Streamable HTTP, per-user credentials)
       CodeUri: .
       Handler: coinspot_mcp.lambda_handler.handler
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
       Environment:
         Variables:
           COINSPOT_MCP_AUTH_TOKEN: !Ref McpAuthToken
+          COINSPOT_MCP_ALLOWED_HOSTS: !Ref McpAllowedHosts
           COINSPOT_ALLOW_TRADING: !Ref AllowTrading
           COINSPOT_ALLOW_WITHDRAWALS: !Ref AllowWithdrawals
           COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN: !Ref DestructiveConfirmToken
           COINSPOT_MAX_ORDER_AMOUNT: !Ref MaxOrderAmount
           COINSPOT_MAX_WITHDRAW_AMOUNT: !Ref MaxWithdrawAmount
           COINSPOT_WITHDRAW_ADDRESS_ALLOWLIST: !Ref WithdrawAddressAllowlist
+      # No browser CORS block: MCP clients are expected to be non-browser hosts.
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: BUFFERED
-        Cors:
-          AllowOrigins:
-            - "*"
-          AllowHeaders:
-            - "*"
-          AllowMethods:
-            - "*"
-          MaxAge: 86400
     Metadata:
       BuildMethod: makefile
 
@@ -79,6 +87,22 @@ Resources:
     Properties:
       LogGroupName: !Sub "/aws/lambda/${CoinspotMcpFunction}"
       RetentionInDays: 14
+
+  HighInvokeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Unusual invoke volume on CoinSpot MCP Lambda (possible URL abuse)
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CoinspotMcpFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 500
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
 
 Outputs:
   McpFunctionUrl:
@@ -92,3 +116,7 @@ Outputs:
   FunctionName:
     Description: Lambda function name
     Value: !Ref CoinspotMcpFunction
+  DnsRebindingHint:
+    Description: Set McpAllowedHosts to this host (no https://) and redeploy to enable DNS rebinding protection
+    Condition: HasAllowedHosts
+    Value: !Ref McpAllowedHosts
