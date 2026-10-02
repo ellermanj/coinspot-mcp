@@ -1,21 +1,13 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: CoinSpot MCP server on AWS Lambda (Streamable HTTP)
+Description: CoinSpot MCP server on AWS Lambda (Streamable HTTP, per-user CoinSpot creds)
 
 Parameters:
-  CoinspotApiKey:
-    Type: String
-    NoEcho: true
-    Description: CoinSpot API key (stored in Secrets Manager)
-  CoinspotApiSecret:
-    Type: String
-    NoEcho: true
-    Description: CoinSpot API secret (stored in Secrets Manager)
   McpAuthToken:
     Type: String
     NoEcho: true
-    Default: ""
-    Description: Optional bearer token required by the MCP Function URL
+    MinLength: 16
+    Description: Required bearer token for MCP Function URL access (Authorization Bearer)
   AllowTrading:
     Type: String
     Default: "false"
@@ -52,30 +44,15 @@ Globals:
     Tracing: Active
 
 Resources:
-  CoinspotSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: !Sub "${AWS::StackName}/coinspot-credentials"
-      Description: CoinSpot API credentials for the MCP Lambda
-      SecretString: !Sub |
-        {
-          "api_key": "${CoinspotApiKey}",
-          "api_secret": "${CoinspotApiSecret}"
-        }
-      Tags:
-        - Key: Project
-          Value: coinspot-mcp
-
   CoinspotMcpFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-mcp"
-      Description: CoinSpot Australia MCP server (Streamable HTTP)
+      Description: CoinSpot Australia MCP server (Streamable HTTP, per-user credentials)
       CodeUri: .
       Handler: coinspot_mcp.lambda_handler.handler
       Environment:
         Variables:
-          COINSPOT_SECRET_ARN: !Ref CoinspotSecret
           COINSPOT_MCP_AUTH_TOKEN: !Ref McpAuthToken
           COINSPOT_ALLOW_TRADING: !Ref AllowTrading
           COINSPOT_ALLOW_WITHDRAWALS: !Ref AllowWithdrawals
@@ -83,9 +60,6 @@ Resources:
           COINSPOT_MAX_ORDER_AMOUNT: !Ref MaxOrderAmount
           COINSPOT_MAX_WITHDRAW_AMOUNT: !Ref MaxWithdrawAmount
           COINSPOT_WITHDRAW_ADDRESS_ALLOWLIST: !Ref WithdrawAddressAllowlist
-      Policies:
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref CoinspotSecret
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: BUFFERED
@@ -115,9 +89,6 @@ Outputs:
     Value: !Sub
       - "${Url}mcp"
       - Url: !GetAtt CoinspotMcpFunctionUrl.FunctionUrl
-  CoinspotSecretArn:
-    Description: Secrets Manager ARN for CoinSpot credentials
-    Value: !Ref CoinspotSecret
   FunctionName:
     Description: Lambda function name
     Value: !Ref CoinspotMcpFunction

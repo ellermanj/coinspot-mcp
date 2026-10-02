@@ -17,6 +17,8 @@ _SENSITIVE_PARAM_KEYS = frozenset(
     {
         "api_key",
         "api_secret",
+        "coinspot_api_key",
+        "coinspot_api_secret",
         "secret",
         "password",
         "token",

@@ -11,41 +11,6 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from coinspot_mcp.server import apply_tool_exposure_policy, mcp
 
-_SECRET_LOADED = False
-
-
-def _load_coinspot_secret_into_env() -> None:
-    """Load CoinSpot credentials from Secrets Manager when configured.
-
-    Expected secret JSON: {"api_key": "...", "api_secret": "..."}
-    """
-    global _SECRET_LOADED
-    if _SECRET_LOADED:
-        return
-    secret_arn = os.getenv("COINSPOT_SECRET_ARN", "").strip()
-    if not secret_arn:
-        _SECRET_LOADED = True
-        return
-    # Env vars win if already provided (local overrides / tests).
-    if os.getenv("COINSPOT_API_KEY") and os.getenv("COINSPOT_API_SECRET"):
-        _SECRET_LOADED = True
-        return
-
-    import boto3
-
-    client = boto3.client("secretsmanager")
-    payload = client.get_secret_value(SecretId=secret_arn)["SecretString"]
-    data = json.loads(payload)
-    api_key = data.get("api_key") or data.get("COINSPOT_API_KEY")
-    api_secret = data.get("api_secret") or data.get("COINSPOT_API_SECRET")
-    if not api_key or not api_secret:
-        raise RuntimeError(
-            "CoinSpot secret must include api_key and api_secret fields."
-        )
-    os.environ["COINSPOT_API_KEY"] = str(api_key)
-    os.environ["COINSPOT_API_SECRET"] = str(api_secret)
-    _SECRET_LOADED = True
-
 
 def _unauthorized(message: str = "Unauthorized") -> dict[str, Any]:
     return {
@@ -72,10 +37,12 @@ def _extract_bearer_token(event: dict[str, Any]) -> str | None:
 
 
 def _check_mcp_auth(event: dict[str, Any]) -> dict[str, Any] | None:
-    """Optional shared-token gate for public Function URLs."""
+    """Require a bearer token for every MCP connection/request."""
     expected = os.getenv("COINSPOT_MCP_AUTH_TOKEN", "").strip()
     if not expected:
-        return None
+        return _unauthorized(
+            "MCP bearer auth is not configured (COINSPOT_MCP_AUTH_TOKEN)."
+        )
     provided = _extract_bearer_token(event)
     if not provided or provided != expected:
         return _unauthorized("Missing or invalid bearer token")
@@ -102,7 +69,6 @@ def handler(event: dict[str, Any], context: Any) -> Any:
     if auth_error is not None:
         return auth_error
 
-    _load_coinspot_secret_into_env()
     app = create_asgi_app()
     asgi_handler = Mangum(app, lifespan="auto")
     return asgi_handler(event, context)

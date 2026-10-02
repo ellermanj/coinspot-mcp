@@ -16,6 +16,7 @@ capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
 parameter_overrides = "AllowTrading=false AllowWithdrawals=false"
+# McpAuthToken must be supplied at deploy time (required, min length 16).
 
 [default.package.parameters]
 resolve_s3 = true

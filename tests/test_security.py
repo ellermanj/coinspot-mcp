@@ -1,4 +1,4 @@
-"""Tests for Salt-aligned security guards."""
+"""Tests for Salt-aligned security guards and per-user credentials."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from coinspot_mcp.security import (
 )
 from coinspot_mcp.server import (
     apply_tool_exposure_policy,
+    get_my_balances,
     mcp,
     place_buy_order,
     withdraw_coin,
@@ -51,11 +52,19 @@ async def test_privileged_tools_registered_when_enabled(
 
 
 @pytest.mark.asyncio
+async def test_authenticated_tool_requires_user_credentials() -> None:
+    raw = await get_my_balances("", "")
+    data = json.loads(raw)
+    assert data["status"] == "error"
+    assert "coinspot_api_key" in data["message"]
+
+
+@pytest.mark.asyncio
 async def test_order_amount_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COINSPOT_ALLOW_TRADING", "true")
     monkeypatch.setenv("COINSPOT_MAX_ORDER_AMOUNT", "0.01")
     monkeypatch.delenv("COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN", raising=False)
-    raw = await place_buy_order("BTC", 1.0, 100000)
+    raw = await place_buy_order("k", "s", "BTC", 1.0, 100000)
     data = json.loads(raw)
     assert data["status"] == "error"
     assert "COINSPOT_MAX_ORDER_AMOUNT" in data["message"]
@@ -66,7 +75,7 @@ async def test_confirm_token_required(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COINSPOT_ALLOW_TRADING", "true")
     monkeypatch.setenv("COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN", "correct-token")
     monkeypatch.delenv("COINSPOT_MAX_ORDER_AMOUNT", raising=False)
-    denied = json.loads(await place_buy_order("BTC", 0.01, 100000))
+    denied = json.loads(await place_buy_order("k", "s", "BTC", 0.01, 100000))
     assert denied["status"] == "error"
     assert "confirm_token" in denied["message"]
 
@@ -75,15 +84,13 @@ async def test_confirm_token_required(monkeypatch: pytest.MonkeyPatch) -> None:
 @respx.mock
 async def test_confirm_token_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COINSPOT_ALLOW_TRADING", "true")
-    monkeypatch.setenv("COINSPOT_API_KEY", "k")
-    monkeypatch.setenv("COINSPOT_API_SECRET", "s")
     monkeypatch.setenv("COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN", "correct-token")
     monkeypatch.delenv("COINSPOT_MAX_ORDER_AMOUNT", raising=False)
     respx.post(f"{FULL_BASE}/my/buy").mock(
         return_value=httpx.Response(200, json={"status": "ok", "id": "1"})
     )
     raw = await place_buy_order(
-        "BTC", 0.01, 100000, confirm_token="correct-token"
+        "k", "s", "BTC", 0.01, 100000, confirm_token="correct-token"
     )
     assert json.loads(raw)["status"] == "ok"
 
@@ -94,7 +101,7 @@ async def test_withdraw_address_allowlist(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("COINSPOT_WITHDRAW_ADDRESS_ALLOWLIST", "bc1qallowed")
     monkeypatch.delenv("COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN", raising=False)
     monkeypatch.delenv("COINSPOT_MAX_WITHDRAW_AMOUNT", raising=False)
-    raw = await withdraw_coin("BTC", 0.01, "bc1qevil")
+    raw = await withdraw_coin("k", "s", "BTC", 0.01, "bc1qevil")
     data = json.loads(raw)
     assert data["status"] == "error"
     assert "ALLOWLIST" in data["message"]
@@ -104,15 +111,13 @@ async def test_withdraw_address_allowlist(monkeypatch: pytest.MonkeyPatch) -> No
 @respx.mock
 async def test_withdraw_forces_email_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COINSPOT_ALLOW_WITHDRAWALS", "true")
-    monkeypatch.setenv("COINSPOT_API_KEY", "k")
-    monkeypatch.setenv("COINSPOT_API_SECRET", "s")
     monkeypatch.setenv("COINSPOT_WITHDRAW_ADDRESS_ALLOWLIST", "bc1qallowed")
     monkeypatch.delenv("COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN", raising=False)
     monkeypatch.delenv("COINSPOT_MAX_WITHDRAW_AMOUNT", raising=False)
     route = respx.post(f"{FULL_BASE}/my/coin/withdraw/send").mock(
         return_value=httpx.Response(200, json={"status": "ok"})
     )
-    raw = await withdraw_coin("BTC", 0.01, "bc1qallowed")
+    raw = await withdraw_coin("k", "s", "BTC", 0.01, "bc1qallowed")
     assert json.loads(raw)["status"] == "ok"
     body = json.loads(route.calls.last.request.content.decode())
     assert body["emailconfirm"] == "YES"
@@ -158,11 +163,15 @@ def test_enforce_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_audit_log_emitted(
+async def test_audit_log_redacts_user_credentials(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("COINSPOT_ALLOW_TRADING", "false")
     with caplog.at_level(logging.INFO, logger="coinspot_mcp.audit"):
-        await place_buy_order("BTC", 0.01, 1)
-    assert any("tool=place_buy_order" in record.message for record in caplog.records)
-    assert any("outcome=denied" in record.message for record in caplog.records)
+        await place_buy_order("super-secret-key", "super-secret-secret", "BTC", 0.01, 1)
+    joined = " ".join(record.message for record in caplog.records)
+    assert "tool=place_buy_order" in joined
+    assert "outcome=denied" in joined
+    assert "super-secret-key" not in joined
+    assert "super-secret-secret" not in joined
+    assert "[REDACTED]" in joined

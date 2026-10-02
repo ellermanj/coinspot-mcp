@@ -71,7 +71,7 @@ async def test_api_error_status_raises() -> None:
 @pytest.mark.asyncio
 async def test_missing_credentials_raise() -> None:
     async with CoinspotClient(api_key="", api_secret="") as client:
-        with pytest.raises(CoinspotError, match="Missing CoinSpot credentials"):
+        with pytest.raises(CoinspotError, match="coinspot_api_key"):
             await client.my_balances()
 
 

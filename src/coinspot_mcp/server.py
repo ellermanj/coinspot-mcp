@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from mcp.server import MCPServer
@@ -26,14 +26,16 @@ mcp = MCPServer(
     title="CoinSpot Australia",
     description="Access the CoinSpot Australia cryptocurrency exchange API (v2).",
     instructions=(
-        "Use public tools for market prices and order books without credentials. "
-        "Use read-only tools for balances and account history when COINSPOT_API_KEY "
-        "and COINSPOT_API_SECRET are configured. Trading and withdrawal tools are only "
-        "registered when COINSPOT_ALLOW_TRADING / COINSPOT_ALLOW_WITHDRAWALS are enabled, "
-        "and may require COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN plus amount/address limits."
+        "Public market tools do not need CoinSpot credentials. "
+        "For any account/trading tool, the calling LLM must supply the end-user's "
+        "coinspot_api_key and coinspot_api_secret on every call. "
+        "Remote HTTP/Lambda deployments also require a bearer token on the MCP "
+        "connection itself (Authorization: Bearer <COINSPOT_MCP_AUTH_TOKEN>). "
+        "Trading and withdrawal tools are only registered when "
+        "COINSPOT_ALLOW_TRADING / COINSPOT_ALLOW_WITHDRAWALS are enabled."
     ),
     website_url="https://www.coinspot.com.au/v2/api",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
@@ -97,8 +99,24 @@ async def _call(
     return _json(result)
 
 
-def get_client() -> CoinspotClient:
-    return CoinspotClient()
+def get_client(
+    coinspot_api_key: str | None = None,
+    coinspot_api_secret: str | None = None,
+) -> CoinspotClient:
+    """Build a client. Authenticated tools must pass the user's key/secret."""
+    return CoinspotClient(
+        api_key=coinspot_api_key or "",
+        api_secret=coinspot_api_secret or "",
+        use_env_fallback=False,
+    )
+
+
+def _require_user_credentials(coinspot_api_key: str, coinspot_api_secret: str) -> None:
+    if not coinspot_api_key.strip() or not coinspot_api_secret.strip():
+        raise CoinspotError(
+            "coinspot_api_key and coinspot_api_secret are required. "
+            "Pass the end-user's CoinSpot API credentials on this tool call."
+        )
 
 
 def _require_trading() -> None:
@@ -109,6 +127,28 @@ def _require_trading() -> None:
 def _require_withdrawals() -> None:
     if not withdrawals_enabled():
         raise CoinspotError("Withdrawal tools are disabled on this server.")
+
+
+async def _with_user_client(
+    tool_name: str,
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    params: dict[str, Any],
+    operation: Callable[[CoinspotClient], Awaitable[Any]],
+    *,
+    prechecks: Callable[[], None] | None = None,
+) -> str:
+    try:
+        _require_user_credentials(coinspot_api_key, coinspot_api_secret)
+        if prechecks is not None:
+            prechecks()
+    except CoinspotError as exc:
+        message = sanitize_error_message(str(exc))
+        audit_event(tool_name, outcome="denied", params=params, detail=message)
+        return _json({"status": "error", "message": message})
+
+    async with get_client(coinspot_api_key, coinspot_api_secret) as client:
+        return await _call(tool_name, operation(client), params=params)
 
 
 # ---- Public tools -------------------------------------------------------
@@ -219,86 +259,155 @@ async def get_completed_orders_summary(
         )
 
 
-# ---- Read-only account tools --------------------------------------------
+# ---- Authenticated account tools (per-user CoinSpot credentials) --------
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def check_readonly_status() -> str:
-    """Check that the configured read-only/full API credentials are working."""
-    async with get_client() as client:
-        return await _call("check_readonly_status", client.ro_status())
-
-
-@mcp.tool(annotations=_READ_ONLY)
-async def get_my_balances() -> str:
-    """List all coin balances with AUD value and rate."""
-    async with get_client() as client:
-        return await _call("get_my_balances", client.my_balances())
-
-
-@mcp.tool(annotations=_READ_ONLY)
-async def get_my_balance(cointype: str, available: bool = False) -> str:
-    """Get balance details for a single coin.
+async def check_readonly_status(
+    coinspot_api_key: str, coinspot_api_secret: str
+) -> str:
+    """Check that the supplied CoinSpot credentials work against the read-only API.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
+    """
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+    }
+    return await _with_user_client(
+        "check_readonly_status",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.ro_status(),
+    )
+
+
+@mcp.tool(annotations=_READ_ONLY)
+async def get_my_balances(coinspot_api_key: str, coinspot_api_secret: str) -> str:
+    """List all coin balances with AUD value and rate for the given user account.
+
+    Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
+    """
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+    }
+    return await _with_user_client(
+        "get_my_balances",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_balances(),
+    )
+
+
+@mcp.tool(annotations=_READ_ONLY)
+async def get_my_balance(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    cointype: str,
+    available: bool = False,
+) -> str:
+    """Get balance details for a single coin for the given user account.
+
+    Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker such as BTC or AUD.
         available: If true, also return the available (unlocked) balance.
     """
-    params = {"cointype": cointype, "available": available}
-    async with get_client() as client:
-        return await _call(
-            "get_my_balance",
-            client.my_balance(cointype, available=available),
-            params=params,
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "cointype": cointype,
+        "available": available,
+    }
+    return await _with_user_client(
+        "get_my_balance",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_balance(cointype, available=available),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
 async def get_my_open_market_orders(
-    cointype: str | None = None, markettype: str | None = None
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    cointype: str | None = None,
+    markettype: str | None = None,
 ) -> str:
-    """List your open market orders.
+    """List the user's open market orders.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Optional coin ticker filter.
         markettype: Optional market ticker filter such as AUD or USDT.
     """
-    params = {"cointype": cointype, "markettype": markettype}
-    async with get_client() as client:
-        return await _call(
-            "get_my_open_market_orders",
-            client.my_open_market_orders(cointype, markettype),
-            params=params,
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "cointype": cointype,
+        "markettype": markettype,
+    }
+    return await _with_user_client(
+        "get_my_open_market_orders",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_open_market_orders(cointype, markettype),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def get_my_open_limit_orders(cointype: str | None = None) -> str:
-    """List your open limit/stop orders.
+async def get_my_open_limit_orders(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    cointype: str | None = None,
+) -> str:
+    """List the user's open limit/stop orders.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Optional coin ticker filter.
     """
-    params = {"cointype": cointype}
-    async with get_client() as client:
-        return await _call(
-            "get_my_open_limit_orders",
-            client.my_open_limit_orders(cointype),
-            params=params,
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "cointype": cointype,
+    }
+    return await _with_user_client(
+        "get_my_open_limit_orders",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_open_limit_orders(cointype),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
 async def get_my_order_history(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str | None = None,
     markettype: str | None = None,
     startdate: str | None = None,
     enddate: str | None = None,
     limit: int | None = None,
 ) -> str:
-    """List your completed order history.
+    """List the user's completed order history.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Optional coin ticker filter.
         markettype: Optional market ticker filter.
         startdate: Optional UTC start date YYYY-MM-DD or UNIX epoch.
@@ -306,31 +415,38 @@ async def get_my_order_history(
         limit: Optional max records (default 200, max 500).
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "markettype": markettype,
         "startdate": startdate,
         "enddate": enddate,
         "limit": limit,
     }
-    async with get_client() as client:
-        return await _call(
-            "get_my_order_history",
-            client.my_order_history(cointype, markettype, startdate, enddate, limit),
-            params=params,
-        )
+    return await _with_user_client(
+        "get_my_order_history",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_order_history(cointype, markettype, startdate, enddate, limit),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
 async def get_my_market_order_history(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str | None = None,
     markettype: str | None = None,
     startdate: str | None = None,
     enddate: str | None = None,
     limit: int | None = None,
 ) -> str:
-    """List your completed market order history.
+    """List the user's completed market order history.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Optional coin ticker filter.
         markettype: Optional market ticker filter.
         startdate: Optional UTC start date YYYY-MM-DD or UNIX epoch.
@@ -338,98 +454,188 @@ async def get_my_market_order_history(
         limit: Optional max records (default 200, max 500).
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "markettype": markettype,
         "startdate": startdate,
         "enddate": enddate,
         "limit": limit,
     }
-    async with get_client() as client:
-        return await _call(
-            "get_my_market_order_history",
-            client.my_market_order_history(
-                cointype, markettype, startdate, enddate, limit
-            ),
-            params=params,
-        )
+    return await _with_user_client(
+        "get_my_market_order_history",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_market_order_history(
+            cointype, markettype, startdate, enddate, limit
+        ),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def get_my_send_receive_history() -> str:
-    """List your coin send and receive transaction history."""
-    async with get_client() as client:
-        return await _call("get_my_send_receive_history", client.my_send_receive())
-
-
-@mcp.tool(annotations=_READ_ONLY)
-async def get_my_deposits(startdate: str | None = None, enddate: str | None = None) -> str:
-    """List your AUD deposit history.
+async def get_my_send_receive_history(
+    coinspot_api_key: str, coinspot_api_secret: str
+) -> str:
+    """List the user's coin send and receive transaction history.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
+    """
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+    }
+    return await _with_user_client(
+        "get_my_send_receive_history",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_send_receive(),
+    )
+
+
+@mcp.tool(annotations=_READ_ONLY)
+async def get_my_deposits(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    startdate: str | None = None,
+    enddate: str | None = None,
+) -> str:
+    """List the user's AUD deposit history.
+
+    Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         startdate: Optional UTC start date YYYY-MM-DD or UNIX epoch.
         enddate: Optional UTC end date YYYY-MM-DD or UNIX epoch.
     """
-    params = {"startdate": startdate, "enddate": enddate}
-    async with get_client() as client:
-        return await _call(
-            "get_my_deposits", client.my_deposits(startdate, enddate), params=params
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "startdate": startdate,
+        "enddate": enddate,
+    }
+    return await _with_user_client(
+        "get_my_deposits",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_deposits(startdate, enddate),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
 async def get_my_withdrawals(
-    startdate: str | None = None, enddate: str | None = None
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    startdate: str | None = None,
+    enddate: str | None = None,
 ) -> str:
-    """List your AUD withdrawal history.
+    """List the user's AUD withdrawal history.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         startdate: Optional UTC start date YYYY-MM-DD or UNIX epoch.
         enddate: Optional UTC end date YYYY-MM-DD or UNIX epoch.
     """
-    params = {"startdate": startdate, "enddate": enddate}
-    async with get_client() as client:
-        return await _call(
-            "get_my_withdrawals",
-            client.my_withdrawals(startdate, enddate),
-            params=params,
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "startdate": startdate,
+        "enddate": enddate,
+    }
+    return await _with_user_client(
+        "get_my_withdrawals",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_withdrawals(startdate, enddate),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def get_my_affiliate_payments() -> str:
-    """List completed affiliate payments."""
-    async with get_client() as client:
-        return await _call("get_my_affiliate_payments", client.my_affiliate_payments())
+async def get_my_affiliate_payments(
+    coinspot_api_key: str, coinspot_api_secret: str
+) -> str:
+    """List completed affiliate payments for the user.
+
+    Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
+    """
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+    }
+    return await _with_user_client(
+        "get_my_affiliate_payments",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_affiliate_payments(),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def get_my_referral_payments() -> str:
-    """List completed referral payments."""
-    async with get_client() as client:
-        return await _call("get_my_referral_payments", client.my_referral_payments())
+async def get_my_referral_payments(
+    coinspot_api_key: str, coinspot_api_secret: str
+) -> str:
+    """List completed referral payments for the user.
+
+    Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
+    """
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+    }
+    return await _with_user_client(
+        "get_my_referral_payments",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.my_referral_payments(),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
 async def get_readonly_market_open_orders(
-    cointype: str, markettype: str | None = None
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    cointype: str,
+    markettype: str | None = None,
 ) -> str:
     """List open market orders via the authenticated read-only API.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker such as BTC.
         markettype: Optional market ticker such as AUD or USDT.
     """
-    params = {"cointype": cointype, "markettype": markettype}
-    async with get_client() as client:
-        return await _call(
-            "get_readonly_market_open_orders",
-            client.ro_market_open_orders(cointype, markettype),
-            params=params,
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "cointype": cointype,
+        "markettype": markettype,
+    }
+    return await _with_user_client(
+        "get_readonly_market_open_orders",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.ro_market_open_orders(cointype, markettype),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
 async def get_readonly_market_completed_orders(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str,
     markettype: str | None = None,
     startdate: str | None = None,
@@ -439,6 +645,8 @@ async def get_readonly_market_completed_orders(
     """List completed market orders via the authenticated read-only API.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker such as BTC.
         markettype: Optional market ticker such as AUD or USDT.
         startdate: Optional UTC start date YYYY-MM-DD or UNIX epoch.
@@ -446,124 +654,224 @@ async def get_readonly_market_completed_orders(
         limit: Optional max records (default 200, max 500).
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "markettype": markettype,
         "startdate": startdate,
         "enddate": enddate,
         "limit": limit,
     }
-    async with get_client() as client:
-        return await _call(
-            "get_readonly_market_completed_orders",
-            client.ro_market_completed_orders(
-                cointype, markettype, startdate, enddate, limit
-            ),
-            params=params,
-        )
-
-
-# ---- Full-access / quote tools ------------------------------------------
-
-
-@mcp.tool(annotations=_READ_ONLY)
-async def check_full_access_status() -> str:
-    """Check that the configured full-access API credentials are working."""
-    async with get_client() as client:
-        return await _call("check_full_access_status", client.full_status())
+    return await _with_user_client(
+        "get_readonly_market_completed_orders",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.ro_market_completed_orders(
+            cointype, markettype, startdate, enddate, limit
+        ),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def get_coin_deposit_address(cointype: str) -> str:
+async def check_full_access_status(
+    coinspot_api_key: str, coinspot_api_secret: str
+) -> str:
+    """Check that the supplied credentials work against the full-access API.
+
+    Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
+    """
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+    }
+    return await _with_user_client(
+        "check_full_access_status",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.full_status(),
+    )
+
+
+@mcp.tool(annotations=_READ_ONLY)
+async def get_coin_deposit_address(
+    coinspot_api_key: str, coinspot_api_secret: str, cointype: str
+) -> str:
     """Get deposit networks and addresses for a coin.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker such as BTC.
     """
-    params = {"cointype": cointype}
-    async with get_client() as client:
-        return await _call(
-            "get_coin_deposit_address",
-            client.coin_deposit_address(cointype),
-            params=params,
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "cointype": cointype,
+    }
+    return await _with_user_client(
+        "get_coin_deposit_address",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.coin_deposit_address(cointype),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def get_buy_now_coin_list() -> str:
-    """List coins available for Buy Now."""
-    async with get_client() as client:
-        return await _call("get_buy_now_coin_list", client.buy_now_coin_list())
+async def get_buy_now_coin_list(
+    coinspot_api_key: str, coinspot_api_secret: str
+) -> str:
+    """List coins available for Buy Now.
+
+    Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
+    """
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+    }
+    return await _with_user_client(
+        "get_buy_now_coin_list",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.buy_now_coin_list(),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def get_sell_now_coin_list() -> str:
-    """List coins available for Sell/Swap Now."""
-    async with get_client() as client:
-        return await _call("get_sell_now_coin_list", client.sell_now_coin_list())
+async def get_sell_now_coin_list(
+    coinspot_api_key: str, coinspot_api_secret: str
+) -> str:
+    """List coins available for Sell/Swap Now.
+
+    Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
+    """
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+    }
+    return await _with_user_client(
+        "get_sell_now_coin_list",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.sell_now_coin_list(),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def quote_buy_now(cointype: str, amount: float, amounttype: str = "coin") -> str:
+async def quote_buy_now(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    cointype: str,
+    amount: float,
+    amounttype: str = "coin",
+) -> str:
     """Get a Buy Now quote.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker such as BTC.
         amount: Amount to buy.
         amounttype: Whether amount is 'coin' or 'aud'.
     """
-    params = {"cointype": cointype, "amount": amount, "amounttype": amounttype}
-    async with get_client() as client:
-        return await _call(
-            "quote_buy_now",
-            client.quote_buy_now(cointype, amount, amounttype),
-            params=params,
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "cointype": cointype,
+        "amount": amount,
+        "amounttype": amounttype,
+    }
+    return await _with_user_client(
+        "quote_buy_now",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.quote_buy_now(cointype, amount, amounttype),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def quote_sell_now(cointype: str, amount: float, amounttype: str = "coin") -> str:
+async def quote_sell_now(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    cointype: str,
+    amount: float,
+    amounttype: str = "coin",
+) -> str:
     """Get a Sell Now quote.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker such as BTC.
         amount: Amount to sell.
         amounttype: Whether amount is 'coin' or 'aud'.
     """
-    params = {"cointype": cointype, "amount": amount, "amounttype": amounttype}
-    async with get_client() as client:
-        return await _call(
-            "quote_sell_now",
-            client.quote_sell_now(cointype, amount, amounttype),
-            params=params,
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "cointype": cointype,
+        "amount": amount,
+        "amounttype": amounttype,
+    }
+    return await _with_user_client(
+        "quote_sell_now",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.quote_sell_now(cointype, amount, amounttype),
+    )
 
 
 @mcp.tool(annotations=_READ_ONLY)
-async def quote_swap_now(cointypesell: str, cointypebuy: str, amount: float) -> str:
+async def quote_swap_now(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    cointypesell: str,
+    cointypebuy: str,
+    amount: float,
+) -> str:
     """Get a Swap Now quote.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointypesell: Coin ticker to sell/swap from.
         cointypebuy: Coin ticker to receive.
         amount: Amount of the sell coin to swap.
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointypesell": cointypesell,
         "cointypebuy": cointypebuy,
         "amount": amount,
     }
-    async with get_client() as client:
-        return await _call(
-            "quote_swap_now",
-            client.quote_swap_now(cointypesell, cointypebuy, amount),
-            params=params,
-        )
+    return await _with_user_client(
+        "quote_swap_now",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.quote_swap_now(cointypesell, cointypebuy, amount),
+    )
 
 
 # ---- Privileged tools (registered only when env flags allow) ------------
 
 
 async def place_buy_order(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str,
     amount: float,
     rate: float,
@@ -573,6 +881,8 @@ async def place_buy_order(
     """Place a limit/market buy order.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker such as BTC.
         amount: Coin amount to buy.
         rate: Limit rate in market currency.
@@ -580,29 +890,33 @@ async def place_buy_order(
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "amount": amount,
         "rate": rate,
         "markettype": markettype,
         "confirm_token": confirm_token,
     }
-    try:
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
         enforce_order_amount(amount)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("place_buy_order", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "place_buy_order",
-            client.place_buy_order(cointype, amount, rate, markettype),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "place_buy_order",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.place_buy_order(cointype, amount, rate, markettype),
+        prechecks=_pre,
+    )
 
 
 async def edit_buy_order(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str,
     order_id: str,
     rate: float,
@@ -612,6 +926,8 @@ async def edit_buy_order(
     """Edit an open buy order rate.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker.
         order_id: Existing buy order id.
         rate: Current order rate.
@@ -619,28 +935,32 @@ async def edit_buy_order(
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "order_id": order_id,
         "rate": rate,
         "newrate": newrate,
         "confirm_token": confirm_token,
     }
-    try:
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("edit_buy_order", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "edit_buy_order",
-            client.edit_buy_order(cointype, order_id, rate, newrate),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "edit_buy_order",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.edit_buy_order(cointype, order_id, rate, newrate),
+        prechecks=_pre,
+    )
 
 
 async def place_buy_now(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str,
     amount: float,
     amounttype: str = "coin",
@@ -652,6 +972,8 @@ async def place_buy_now(
     """Place a Buy Now (instant) order.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker.
         amount: Amount to buy.
         amounttype: 'coin' or 'aud'.
@@ -661,6 +983,8 @@ async def place_buy_now(
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "amount": amount,
         "amounttype": amounttype,
@@ -669,23 +993,27 @@ async def place_buy_now(
         "direction": direction,
         "confirm_token": confirm_token,
     }
-    try:
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
         enforce_order_amount(amount)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("place_buy_now", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "place_buy_now",
-            client.place_buy_now(cointype, amount, amounttype, rate, threshold, direction),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "place_buy_now",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.place_buy_now(
+            cointype, amount, amounttype, rate, threshold, direction
+        ),
+        prechecks=_pre,
+    )
 
 
 async def place_sell_order(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str,
     amount: float,
     rate: float,
@@ -695,6 +1023,8 @@ async def place_sell_order(
     """Place a limit/market sell order.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker.
         amount: Coin amount to sell.
         rate: Limit rate in market currency.
@@ -702,29 +1032,33 @@ async def place_sell_order(
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "amount": amount,
         "rate": rate,
         "markettype": markettype,
         "confirm_token": confirm_token,
     }
-    try:
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
         enforce_order_amount(amount)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("place_sell_order", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "place_sell_order",
-            client.place_sell_order(cointype, amount, rate, markettype),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "place_sell_order",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.place_sell_order(cointype, amount, rate, markettype),
+        prechecks=_pre,
+    )
 
 
 async def edit_sell_order(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str,
     order_id: str,
     rate: float,
@@ -734,6 +1068,8 @@ async def edit_sell_order(
     """Edit an open sell order rate.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker.
         order_id: Existing sell order id.
         rate: Current order rate.
@@ -741,28 +1077,32 @@ async def edit_sell_order(
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "order_id": order_id,
         "rate": rate,
         "newrate": newrate,
         "confirm_token": confirm_token,
     }
-    try:
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("edit_sell_order", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "edit_sell_order",
-            client.edit_sell_order(cointype, order_id, rate, newrate),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "edit_sell_order",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.edit_sell_order(cointype, order_id, rate, newrate),
+        prechecks=_pre,
+    )
 
 
 async def place_sell_now(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str,
     amount: float,
     amounttype: str = "coin",
@@ -774,6 +1114,8 @@ async def place_sell_now(
     """Place a Sell Now (instant) order.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker.
         amount: Amount to sell.
         amounttype: 'coin' or 'aud'.
@@ -783,6 +1125,8 @@ async def place_sell_now(
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "amount": amount,
         "amounttype": amounttype,
@@ -791,25 +1135,27 @@ async def place_sell_now(
         "direction": direction,
         "confirm_token": confirm_token,
     }
-    try:
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
         enforce_order_amount(amount)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("place_sell_now", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "place_sell_now",
-            client.place_sell_now(
-                cointype, amount, amounttype, rate, threshold, direction
-            ),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "place_sell_now",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.place_sell_now(
+            cointype, amount, amounttype, rate, threshold, direction
+        ),
+        prechecks=_pre,
+    )
 
 
 async def place_swap_now(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointypesell: str,
     cointypebuy: str,
     amount: float,
@@ -821,6 +1167,8 @@ async def place_swap_now(
     """Place a Swap Now order.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointypesell: Coin ticker to sell/swap from.
         cointypebuy: Coin ticker to receive.
         amount: Amount of sell coin.
@@ -830,6 +1178,8 @@ async def place_swap_now(
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointypesell": cointypesell,
         "cointypebuy": cointypebuy,
         "amount": amount,
@@ -838,147 +1188,192 @@ async def place_swap_now(
         "direction": direction,
         "confirm_token": confirm_token,
     }
-    try:
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
         enforce_order_amount(amount)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("place_swap_now", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "place_swap_now",
-            client.place_swap_now(
-                cointypesell, cointypebuy, amount, rate, threshold, direction
-            ),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "place_swap_now",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.place_swap_now(
+            cointypesell, cointypebuy, amount, rate, threshold, direction
+        ),
+        prechecks=_pre,
+    )
 
 
-async def cancel_buy_order(order_id: str, confirm_token: str | None = None) -> str:
+async def cancel_buy_order(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    order_id: str,
+    confirm_token: str | None = None,
+) -> str:
     """Cancel an open buy order.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         order_id: Buy order id to cancel.
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
-    params = {"order_id": order_id, "confirm_token": confirm_token}
-    try:
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "order_id": order_id,
+        "confirm_token": confirm_token,
+    }
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("cancel_buy_order", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "cancel_buy_order", client.cancel_buy_order(order_id), params=params
-        )
+
+    return await _with_user_client(
+        "cancel_buy_order",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.cancel_buy_order(order_id),
+        prechecks=_pre,
+    )
 
 
 async def cancel_all_buy_orders(
-    coin: str | None = None, confirm_token: str | None = None
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    coin: str | None = None,
+    confirm_token: str | None = None,
 ) -> str:
     """Cancel all open buy orders, optionally filtered by coin.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         coin: Optional coin ticker filter.
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
-    params = {"coin": coin, "confirm_token": confirm_token}
-    try:
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "coin": coin,
+        "confirm_token": confirm_token,
+    }
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event(
-            "cancel_all_buy_orders", outcome="denied", params=params, detail=message
-        )
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "cancel_all_buy_orders",
-            client.cancel_all_buy_orders(coin),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "cancel_all_buy_orders",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.cancel_all_buy_orders(coin),
+        prechecks=_pre,
+    )
 
 
-async def cancel_sell_order(order_id: str, confirm_token: str | None = None) -> str:
+async def cancel_sell_order(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    order_id: str,
+    confirm_token: str | None = None,
+) -> str:
     """Cancel an open sell order.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         order_id: Sell order id to cancel.
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
-    params = {"order_id": order_id, "confirm_token": confirm_token}
-    try:
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "order_id": order_id,
+        "confirm_token": confirm_token,
+    }
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("cancel_sell_order", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "cancel_sell_order", client.cancel_sell_order(order_id), params=params
-        )
+
+    return await _with_user_client(
+        "cancel_sell_order",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.cancel_sell_order(order_id),
+        prechecks=_pre,
+    )
 
 
 async def cancel_all_sell_orders(
-    coin: str | None = None, confirm_token: str | None = None
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
+    coin: str | None = None,
+    confirm_token: str | None = None,
 ) -> str:
     """Cancel all open sell orders, optionally filtered by coin.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         coin: Optional coin ticker filter.
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
-    params = {"coin": coin, "confirm_token": confirm_token}
-    try:
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "coin": coin,
+        "confirm_token": confirm_token,
+    }
+
+    def _pre() -> None:
         _require_trading()
         require_destructive_confirmation(confirm_token)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event(
-            "cancel_all_sell_orders", outcome="denied", params=params, detail=message
-        )
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "cancel_all_sell_orders",
-            client.cancel_all_sell_orders(coin),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "cancel_all_sell_orders",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.cancel_all_sell_orders(coin),
+        prechecks=_pre,
+    )
 
 
-async def get_coin_withdraw_details(cointype: str) -> str:
+async def get_coin_withdraw_details(
+    coinspot_api_key: str, coinspot_api_secret: str, cointype: str
+) -> str:
     """Get withdrawal networks, fees, and minimums for a coin.
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker such as BTC.
     """
-    params = {"cointype": cointype}
-    try:
-        _require_withdrawals()
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event(
-            "get_coin_withdraw_details",
-            outcome="denied",
-            params=params,
-            detail=message,
-        )
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "get_coin_withdraw_details",
-            client.coin_withdraw_details(cointype),
-            params=params,
-        )
+    params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
+        "cointype": cointype,
+    }
+    return await _with_user_client(
+        "get_coin_withdraw_details",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.coin_withdraw_details(cointype),
+        prechecks=_require_withdrawals,
+    )
 
 
 async def withdraw_coin(
+    coinspot_api_key: str,
+    coinspot_api_secret: str,
     cointype: str,
     amount: float,
     address: str,
@@ -988,10 +1383,11 @@ async def withdraw_coin(
 ) -> str:
     """Withdraw coins to an external address.
 
-    Always requests CoinSpot email confirmation (emailconfirm=YES). Callers cannot
-    disable that safeguard. Requires COINSPOT_ALLOW_WITHDRAWALS=true.
+    Always requests CoinSpot email confirmation (emailconfirm=YES).
 
     Args:
+        coinspot_api_key: End-user CoinSpot API key.
+        coinspot_api_secret: End-user CoinSpot API secret.
         cointype: Coin ticker.
         amount: Amount to withdraw.
         address: Destination address.
@@ -1000,6 +1396,8 @@ async def withdraw_coin(
         confirm_token: Required when COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN is set.
     """
     params = {
+        "coinspot_api_key": coinspot_api_key,
+        "coinspot_api_secret": coinspot_api_secret,
         "cointype": cointype,
         "amount": amount,
         "address": address,
@@ -1007,27 +1405,27 @@ async def withdraw_coin(
         "paymentid": paymentid,
         "confirm_token": confirm_token,
     }
-    try:
+
+    def _pre() -> None:
         _require_withdrawals()
         require_destructive_confirmation(confirm_token)
         enforce_withdraw_amount(amount)
         enforce_withdraw_address(address)
-    except CoinspotError as exc:
-        message = sanitize_error_message(str(exc))
-        audit_event("withdraw_coin", outcome="denied", params=params, detail=message)
-        return _json({"status": "error", "message": message})
-    async with get_client() as client:
-        return await _call(
-            "withdraw_coin",
-            client.coin_withdraw(
-                cointype,
-                amount,
-                address,
-                network=network,
-                paymentid=paymentid,
-            ),
-            params=params,
-        )
+
+    return await _with_user_client(
+        "withdraw_coin",
+        coinspot_api_key,
+        coinspot_api_secret,
+        params,
+        lambda c: c.coin_withdraw(
+            cointype,
+            amount,
+            address,
+            network=network,
+            paymentid=paymentid,
+        ),
+        prechecks=_pre,
+    )
 
 
 _PRIVILEGED_TOOLS: dict[str, Any] = {
@@ -1051,7 +1449,6 @@ def _safe_remove_tool(name: str) -> None:
     try:
         mcp.remove_tool(name)
     except Exception:
-        # Tool may already be absent depending on prior policy application.
         pass
 
 
@@ -1073,7 +1470,6 @@ def apply_tool_exposure_policy() -> None:
         mcp.add_tool(withdraw_coin, name="withdraw_coin", annotations=_DESTRUCTIVE)
 
 
-# Apply least-privilege tool exposure at import time (stdio server startup).
 apply_tool_exposure_policy()
 
 

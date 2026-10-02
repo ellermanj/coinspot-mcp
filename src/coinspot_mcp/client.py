@@ -36,11 +36,24 @@ class CoinspotClient:
         *,
         timeout: float = 30.0,
         client: httpx.AsyncClient | None = None,
+        use_env_fallback: bool = False,
     ) -> None:
-        self.api_key = api_key if api_key is not None else os.getenv("COINSPOT_API_KEY", "")
-        self.api_secret = (
-            api_secret if api_secret is not None else os.getenv("COINSPOT_API_SECRET", "")
-        )
+        # Per-user architecture: credentials are normally supplied per request.
+        # Env fallback is opt-in for local/dev convenience only.
+        if api_key is not None:
+            self.api_key = api_key
+        elif use_env_fallback:
+            self.api_key = os.getenv("COINSPOT_API_KEY", "")
+        else:
+            self.api_key = ""
+
+        if api_secret is not None:
+            self.api_secret = api_secret
+        elif use_env_fallback:
+            self.api_secret = os.getenv("COINSPOT_API_SECRET", "")
+        else:
+            self.api_secret = ""
+
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._nonce_lock = threading.Lock()
@@ -68,7 +81,8 @@ class CoinspotClient:
     def _require_credentials(self) -> None:
         if not self.api_key or not self.api_secret:
             raise CoinspotError(
-                "Missing CoinSpot credentials. Set COINSPOT_API_KEY and COINSPOT_API_SECRET."
+                "Missing CoinSpot credentials. Provide coinspot_api_key and "
+                "coinspot_api_secret tool arguments for the user's CoinSpot account."
             )
 
     def _sign(self, body: str) -> str:
