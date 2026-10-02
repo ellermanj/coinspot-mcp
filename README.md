@@ -13,6 +13,7 @@ It exposes public market data, read-only account tools, and optional trading/wit
 - **Runtime guards** – optional confirm token, amount caps, and withdrawal address allowlist
 - **Audit logging** – sensitive tool outcomes logged with redacted parameters
 - **HMAC-SHA512 auth** – signs compact JSON bodies as required by CoinSpot
+- **AWS Lambda packaging** – Streamable HTTP via Mangum + SAM (`template.yaml`)
 
 API reference: [CoinSpot API v2](https://www.coinspot.com.au/v2/api) (legacy docs: [v1](https://www.coinspot.com.au/api))
 
@@ -104,6 +105,60 @@ Add to your MCP settings (e.g. `~/.cursor/mcp.json`):
 uv sync
 uv run pytest
 ```
+
+## AWS Lambda (SAM)
+
+This repo includes SAM packaging for a Function URL MCP endpoint.
+
+### Prerequisites
+
+- AWS credentials (`aws login` / configured profile)
+- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
+- `uv` on your `PATH` (used by the Makefile build)
+
+### Build
+
+```bash
+uv sync
+sam validate --lint
+sam build
+```
+
+### Deploy (when ready)
+
+```bash
+sam deploy --guided \
+  --parameter-overrides \
+    "CoinspotApiKey=YOUR_KEY" \
+    "CoinspotApiSecret=YOUR_SECRET" \
+    "McpAuthToken=LONG_RANDOM_TOKEN" \
+    "AllowTrading=false" \
+    "AllowWithdrawals=false"
+```
+
+Or use `samconfig.toml` defaults (`ap-southeast-2`, stack `coinspot-mcp`) and pass secrets as parameter overrides.
+
+Outputs include:
+
+- `McpEndpoint` → `https://<function-url>/mcp`
+- `CoinspotSecretArn` → Secrets Manager ARN used by the function
+
+### Client config (HTTP MCP)
+
+```json
+{
+  "mcpServers": {
+    "coinspot": {
+      "url": "https://YOUR_FUNCTION_URL/mcp",
+      "headers": {
+        "Authorization": "Bearer LONG_RANDOM_TOKEN"
+      }
+    }
+  }
+}
+```
+
+Set `McpAuthToken` at deploy time so the Function URL is not anonymously open. CoinSpot credentials are loaded from Secrets Manager at runtime (`COINSPOT_SECRET_ARN`), not baked into tool arguments.
 
 ## Security notes
 

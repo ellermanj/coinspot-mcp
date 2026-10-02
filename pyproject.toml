@@ -1,6 +1,6 @@
 [project]
 name = "coinspot-mcp"
-version = "0.1.1"
+version = "0.2.0"
 description = "MCP server for the CoinSpot Australia cryptocurrency exchange API"
 readme = "README.md"
 license = "MIT"
@@ -10,6 +10,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
+    "mangum>=0.22.0",
     "mcp[cli]>=2.0.0",
 ]
 

@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: CoinSpot MCP server on AWS Lambda (Streamable HTTP)
+
+Parameters:
+  CoinspotApiKey:
+    Type: String
+    NoEcho: true
+    Description: CoinSpot API key (stored in Secrets Manager)
+  CoinspotApiSecret:
+    Type: String
+    NoEcho: true
+    Description: CoinSpot API secret (stored in Secrets Manager)
+  McpAuthToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Optional bearer token required by the MCP Function URL
+  AllowTrading:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  AllowWithdrawals:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  DestructiveConfirmToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Optional confirm token required for destructive tools
+  MaxOrderAmount:
+    Type: String
+    Default: ""
+    Description: Optional max order amount guard
+  MaxWithdrawAmount:
+    Type: String
+    Default: ""
+    Description: Optional max withdraw amount guard
+  WithdrawAddressAllowlist:
+    Type: String
+    Default: ""
+    Description: Optional comma-separated withdrawal address allowlist
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Tracing: Active
+
+Resources:
+  CoinspotSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/coinspot-credentials"
+      Description: CoinSpot API credentials for the MCP Lambda
+      SecretString: !Sub |
+        {
+          "api_key": "${CoinspotApiKey}",
+          "api_secret": "${CoinspotApiSecret}"
+        }
+      Tags:
+        - Key: Project
+          Value: coinspot-mcp
+
+  CoinspotMcpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-mcp"
+      Description: CoinSpot Australia MCP server (Streamable HTTP)
+      CodeUri: .
+      Handler: coinspot_mcp.lambda_handler.handler
+      Environment:
+        Variables:
+          COINSPOT_SECRET_ARN: !Ref CoinspotSecret
+          COINSPOT_MCP_AUTH_TOKEN: !Ref McpAuthToken
+          COINSPOT_ALLOW_TRADING: !Ref AllowTrading
+          COINSPOT_ALLOW_WITHDRAWALS: !Ref AllowWithdrawals
+          COINSPOT_DESTRUCTIVE_CONFIRM_TOKEN: !Ref DestructiveConfirmToken
+          COINSPOT_MAX_ORDER_AMOUNT: !Ref MaxOrderAmount
+          COINSPOT_MAX_WITHDRAW_AMOUNT: !Ref MaxWithdrawAmount
+          COINSPOT_WITHDRAW_ADDRESS_ALLOWLIST: !Ref WithdrawAddressAllowlist
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref CoinspotSecret
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+        Cors:
+          AllowOrigins:
+            - "*"
+          AllowHeaders:
+            - "*"
+          AllowMethods:
+            - "*"
+          MaxAge: 86400
+    Metadata:
+      BuildMethod: makefile
+
+  CoinspotMcpFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CoinspotMcpFunction}"
+      RetentionInDays: 14
+
+Outputs:
+  McpFunctionUrl:
+    Description: Base Function URL (append /mcp for the MCP endpoint)
+    Value: !GetAtt CoinspotMcpFunctionUrl.FunctionUrl
+  McpEndpoint:
+    Description: Streamable HTTP MCP endpoint
+    Value: !Sub
+      - "${Url}mcp"
+      - Url: !GetAtt CoinspotMcpFunctionUrl.FunctionUrl
+  CoinspotSecretArn:
+    Description: Secrets Manager ARN for CoinSpot credentials
+    Value: !Ref CoinspotSecret
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref CoinspotMcpFunction
